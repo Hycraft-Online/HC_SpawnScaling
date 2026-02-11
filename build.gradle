@@ -1,0 +1,67 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '9.3.0'
+}
+
+version = project.version
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(java_version)
+    withSourcesJar()
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Path to HytaleServer.jar
+    def localServerJar = file("${rootProject.projectDir}/../../server-files/Server/HytaleServer.jar")
+    def serverJarPath = localServerJar.exists()
+        ? localServerJar.absolutePath
+        : "$hytaleHome/$patchline/package/game/$game_build/Server/HytaleServer.jar"
+    implementation(files(serverJarPath))
+}
+
+shadowJar {
+    archiveClassifier.set('')
+    mergeServiceFiles()
+}
+
+tasks.build {
+    dependsOn("shadowJar")
+}
+
+processResources {
+    var expandProps = [
+        'name'          : project.name,
+        'version'       : project.version,
+        'group'         : project.group,
+        'description'   : mod_description,
+        'server_version': server_version,
+        'entry_point'   : entry_point
+    ]
+
+    filesMatching(['manifest.json']) {
+        expand expandProps
+    }
+    inputs.properties(expandProps)
+}
+
+task deploy(dependsOn: 'build') {
+    doLast {
+        def modsDir = file("${rootProject.projectDir}/../../server-files/mods")
+        def jarFile = file("${buildDir}/libs/${project.name}-${project.version}.jar")
+
+        if (!modsDir.exists()) {
+            modsDir.mkdirs()
+        }
+
+        copy {
+            from jarFile
+            into modsDir
+        }
+
+        println "Deployed ${jarFile.name} to ${modsDir}"
+    }
+}
