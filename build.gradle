@@ -20,7 +20,7 @@ dependencies {
     def serverJarPath = localServerJar.exists()
         ? localServerJar.absolutePath
         : "$hytaleHome/$patchline/package/game/$game_build/Server/HytaleServer.jar"
-    implementation(files(serverJarPath))
+    compileOnly(files(serverJarPath))
 }
 
 shadowJar {
