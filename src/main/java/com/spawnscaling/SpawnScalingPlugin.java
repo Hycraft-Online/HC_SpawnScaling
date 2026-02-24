@@ -10,6 +10,7 @@ import com.hypixel.hytale.server.spawning.assets.spawns.config.BeaconNPCSpawn;
 
 import javax.annotation.Nonnull;
 import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.Map;
 
 /**
@@ -52,7 +53,7 @@ public class SpawnScalingPlugin extends JavaPlugin {
             int successCount = 0;
             int skipCount = 0;
 
-            for (Map.Entry<String, BeaconNPCSpawn> entry : beacons.entrySet()) {
+            for (Map.Entry<String, BeaconNPCSpawn> entry : new ArrayList<>(beacons.entrySet())) {
                 String beaconId = entry.getKey();
                 BeaconNPCSpawn beacon = entry.getValue();
 
