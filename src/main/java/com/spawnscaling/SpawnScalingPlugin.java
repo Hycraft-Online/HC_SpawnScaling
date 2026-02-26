@@ -1,5 +1,7 @@
 package com.spawnscaling;
 
+import com.hccore.api.HC_CoreAPI;
+import com.hccore.models.SettingDef;
 import com.hypixel.hytale.assetstore.map.IndexedLookupTableAssetMap;
 import com.hypixel.hytale.logger.HytaleLogger;
 import com.hypixel.hytale.server.core.asset.type.responsecurve.ScaledXYResponseCurve;
@@ -11,6 +13,7 @@ import com.hypixel.hytale.server.spawning.assets.spawns.config.BeaconNPCSpawn;
 import javax.annotation.Nonnull;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -23,7 +26,7 @@ import java.util.Map;
 public class SpawnScalingPlugin extends JavaPlugin {
 
     private static final HytaleLogger LOGGER = HytaleLogger.forEnclosingClass();
-    private static final int MAX_PLAYERS_TO_SCALE = 20;
+    private static final String PLUGIN = "HC_SpawnScaling";
 
     public SpawnScalingPlugin(@Nonnull JavaPluginInit init) {
         super(init);
@@ -31,6 +34,9 @@ public class SpawnScalingPlugin extends JavaPlugin {
 
     @Override
     protected void setup() {
+        Map<String, SettingDef> defaults = new LinkedHashMap<>();
+        defaults.put("maxPlayersToScale", new SettingDef("20", "INT", "Maximum player count for linear spawn scaling curve"));
+        HC_CoreAPI.registerDefaults(PLUGIN, defaults);
         LOGGER.atInfo().log("[SpawnScaling] Setting up spawn scaling plugin");
     }
 
@@ -70,10 +76,10 @@ public class SpawnScalingPlugin extends JavaPlugin {
                 // At 1 player: base + 0 = base
                 // At 2 players: base + base = 2*base
                 // At MAX_PLAYERS: base + base*(MAX-1) = base*MAX
-                double maxAdditional = baseMaxSpawns * (MAX_PLAYERS_TO_SCALE - 1);
+                double maxAdditional = baseMaxSpawns * (HC_CoreAPI.getSettingInt(PLUGIN, "maxPlayersToScale", 20) - 1);
 
                 ScaledXYResponseCurve curve = createLinearScalingCurve(
-                    1.0, MAX_PLAYERS_TO_SCALE,  // XRange: player count
+                    1.0, HC_CoreAPI.getSettingInt(PLUGIN, "maxPlayersToScale", 20),  // XRange: player count
                     0.0, maxAdditional           // YRange: additional spawns
                 );
 

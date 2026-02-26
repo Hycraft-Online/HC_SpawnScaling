@@ -9,7 +9,9 @@
     }
   ],
   "ServerVersion": "${server_version}",
-  "Dependencies": {},
+  "Dependencies": {
+    "com.hccore:HC_Core": "*"
+  },
   "OptionalDependencies": {},
   "DisabledByDefault": false,
   "Main": "${entry_point}"

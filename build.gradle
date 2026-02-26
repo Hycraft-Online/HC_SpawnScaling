@@ -21,6 +21,9 @@ dependencies {
         ? localServerJar.absolutePath
         : "$hytaleHome/$patchline/package/game/$game_build/Server/HytaleServer.jar"
     compileOnly(files(serverJarPath))
+
+    // HC_Core (settings API)
+    compileOnly(files("${rootProject.projectDir}/../HC_Core/build/libs/HC_Core-${project.version}.jar"))
 }
 
 shadowJar {
