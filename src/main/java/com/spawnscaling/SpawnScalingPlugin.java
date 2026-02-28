@@ -22,6 +22,15 @@ import java.util.Map;
  * Injects MaxSpawnsScalingCurve into all beacon spawns at runtime based on their
  * current MaxSpawnedNPCs value. This ensures each player sees the same number of
  * enemies as they would in single-player, scaling linearly with player count.
+ *
+ * Also supports a flat mob density multiplier (mobDensityMultiplier) that increases
+ * the number of mobs alive at once for all player counts. At 2.0, twice as many mobs
+ * can be alive per beacon. Requires server restart to take effect.
+ *
+ * Hostile beacons (those with NPCSpawnState set, e.g. "Chase") receive full density
+ * and per-player scaling. Passive/ambient beacons (no NPCSpawnState — fish, animals)
+ * receive a separate, reduced multiplier (passiveDensityMultiplier) to prevent them
+ * from consuming mob budget that hostile spawns need.
  */
 public class SpawnScalingPlugin extends JavaPlugin {
 
@@ -36,6 +45,8 @@ public class SpawnScalingPlugin extends JavaPlugin {
     protected void setup() {
         Map<String, SettingDef> defaults = new LinkedHashMap<>();
         defaults.put("maxPlayersToScale", new SettingDef("20", "INT", "Maximum player count for linear spawn scaling curve"));
+        defaults.put("mobDensityMultiplier", new SettingDef("1.0", "FLOAT", "Mob density multiplier for hostile beacons (2.0 = twice as many hostile mobs). Requires restart."));
+        defaults.put("passiveDensityMultiplier", new SettingDef("0.5", "FLOAT", "Mob density multiplier for passive/ambient beacons (fish, animals). 0.5 = half scaling. Requires restart."));
         HC_CoreAPI.registerDefaults(PLUGIN, defaults);
         LOGGER.atInfo().log("[SpawnScaling] Setting up spawn scaling plugin");
     }
@@ -56,7 +67,14 @@ public class SpawnScalingPlugin extends JavaPlugin {
             IndexedLookupTableAssetMap<String, BeaconNPCSpawn> beaconMap = BeaconNPCSpawn.getAssetMap();
             Map<String, BeaconNPCSpawn> beacons = beaconMap.getAssetMap();
 
-            int successCount = 0;
+            int maxPlayers = HC_CoreAPI.getSettingInt(PLUGIN, "maxPlayersToScale", 20);
+            double hostileDensity = HC_CoreAPI.getSettingDouble(PLUGIN, "mobDensityMultiplier", 1.0);
+            if (hostileDensity < 1.0) hostileDensity = 1.0;
+            double passiveDensity = HC_CoreAPI.getSettingDouble(PLUGIN, "passiveDensityMultiplier", 0.5);
+            if (passiveDensity < 0.0) passiveDensity = 0.0;
+
+            int hostileCount = 0;
+            int passiveCount = 0;
             int skipCount = 0;
 
             for (Map.Entry<String, BeaconNPCSpawn> entry : new ArrayList<>(beacons.entrySet())) {
@@ -71,27 +89,51 @@ public class SpawnScalingPlugin extends JavaPlugin {
 
                 int baseMaxSpawns = beacon.getMaxSpawnedNpcs();
 
-                // Create scaling curve: for N players, total = base * N
-                // Since curve ADDS to base, we need: additionalSpawns = base * (N - 1)
-                // At 1 player: base + 0 = base
-                // At 2 players: base + base = 2*base
-                // At MAX_PLAYERS: base + base*(MAX-1) = base*MAX
-                double maxAdditional = baseMaxSpawns * (HC_CoreAPI.getSettingInt(PLUGIN, "maxPlayersToScale", 20) - 1);
+                // Determine if this beacon spawns hostile NPCs.
+                // Beacons with NPCSpawnState (e.g. "Chase") are hostile — NPCs
+                // actively target players and despawn when idle without a target.
+                // Beacons without NPCSpawnState are passive/ambient — fish, animals,
+                // wandering NPCs that persist indefinitely and fill spawn slots.
+                boolean isHostile = beacon.getNpcSpawnState() != null;
+                double density = isHostile ? hostileDensity : passiveDensity;
+
+                // Curve formula: total = base + curve.computeY(playerCount)
+                //
+                // Without density (D=1): total = base * playerCount
+                //   yMin = 0, yMax = base * (maxPlayers - 1)
+                //
+                // With density (D>1): total = D * base * playerCount
+                //   yMin = base * (D - 1)          — bonus even at 1 player
+                //   yMax = base * (D * maxPlayers - 1)
+                //
+                // For passive beacons with D<1, the curve reduces per-player scaling.
+                // At D=0.5 with 20 players: total = 0.5 * base * 20 = 10 * base
+                // instead of 20 * base, keeping passive mob counts much lower.
+                double yMin = baseMaxSpawns * (density - 1.0);
+                double yMax = baseMaxSpawns * (density * maxPlayers - 1.0);
+
+                // Clamp yMin to 0 — negative yMin would reduce spawns below base
+                // for single-player, which we don't want even for passive beacons
+                if (yMin < 0.0) yMin = 0.0;
 
                 ScaledXYResponseCurve curve = createLinearScalingCurve(
-                    1.0, HC_CoreAPI.getSettingInt(PLUGIN, "maxPlayersToScale", 20),  // XRange: player count
-                    0.0, maxAdditional           // YRange: additional spawns
+                    1.0, maxPlayers,  // XRange: player count
+                    yMin, yMax        // YRange: additional spawns
                 );
 
                 if (curve != null && injectCurve(beacon, curve)) {
-                    successCount++;
-                    LOGGER.atFine().log("[SpawnScaling] Injected curve for %s (base=%d, maxAdditional=%.0f)",
-                        beaconId, baseMaxSpawns, maxAdditional);
+                    if (isHostile) {
+                        hostileCount++;
+                    } else {
+                        passiveCount++;
+                    }
+                    LOGGER.atFine().log("[SpawnScaling] Injected curve for %s (base=%d, %s, density=%.1f, yRange=[%.0f, %.0f])",
+                        beaconId, baseMaxSpawns, isHostile ? "hostile" : "passive", density, yMin, yMax);
                 }
             }
 
-            LOGGER.atInfo().log("[SpawnScaling] Injection complete: %d beacons modified, %d skipped (already had curves)",
-                successCount, skipCount);
+            LOGGER.atInfo().log("[SpawnScaling] Injection complete: %d hostile + %d passive beacons modified, %d skipped (already had curves), hostileDensity=%.1fx, passiveDensity=%.1fx",
+                hostileCount, passiveCount, skipCount, hostileDensity, passiveDensity);
 
         } catch (Exception e) {
             LOGGER.atSevere().log("[SpawnScaling] Failed to inject scaling curves: %s", e.getMessage());
