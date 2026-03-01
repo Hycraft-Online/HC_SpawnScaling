@@ -28,9 +28,18 @@ import java.util.Map;
  * can be alive per beacon. Requires server restart to take effect.
  *
  * Hostile beacons (those with NPCSpawnState set, e.g. "Chase") receive full density
- * and per-player scaling. Passive/ambient beacons (no NPCSpawnState — fish, animals)
+ * and per-player scaling. Passive/ambient beacons (no NPCSpawnState -- fish, animals)
  * receive a separate, reduced multiplier (passiveDensityMultiplier) to prevent them
  * from consuming mob budget that hostile spawns need.
+ *
+ * Combat Despawn Protection (HYC-167):
+ * Hostile beacons have their NPCIdleDespawnTime increased from the engine default
+ * (10 seconds) to a configurable value (default 120 seconds). This prevents mobs
+ * from despawning mid-combat when the NPC's AI temporarily loses its target.
+ * The HC_Threat plugin's ThreatTargetSystem continuously re-assigns targets for
+ * NPCs with active threat, but the default 10s window is too short -- if the NPC
+ * loses line-of-sight or pathfinding fails even briefly, the despawn timer can
+ * expire before the target is re-assigned.
  */
 public class SpawnScalingPlugin extends JavaPlugin {
 
@@ -47,6 +56,7 @@ public class SpawnScalingPlugin extends JavaPlugin {
         defaults.put("maxPlayersToScale", new SettingDef("20", "INT", "Maximum player count for linear spawn scaling curve"));
         defaults.put("mobDensityMultiplier", new SettingDef("1.0", "FLOAT", "Mob density multiplier for hostile beacons (2.0 = twice as many hostile mobs). Requires restart."));
         defaults.put("passiveDensityMultiplier", new SettingDef("0.5", "FLOAT", "Mob density multiplier for passive/ambient beacons (fish, animals). 0.5 = half scaling. Requires restart."));
+        defaults.put("hostileIdleDespawnTime", new SettingDef("120.0", "FLOAT", "Seconds a hostile NPC must be idle (no target) before despawning. Engine default is 10s which causes mid-combat despawns. Requires restart."));
         HC_CoreAPI.registerDefaults(PLUGIN, defaults);
         LOGGER.atInfo().log("[SpawnScaling] Setting up spawn scaling plugin");
     }
@@ -72,14 +82,39 @@ public class SpawnScalingPlugin extends JavaPlugin {
             if (hostileDensity < 1.0) hostileDensity = 1.0;
             double passiveDensity = HC_CoreAPI.getSettingDouble(PLUGIN, "passiveDensityMultiplier", 0.5);
             if (passiveDensity < 0.0) passiveDensity = 0.0;
+            double hostileIdleDespawnTime = HC_CoreAPI.getSettingDouble(PLUGIN, "hostileIdleDespawnTime", 120.0);
+            if (hostileIdleDespawnTime < 10.0) hostileIdleDespawnTime = 10.0;
 
             int hostileCount = 0;
             int passiveCount = 0;
             int skipCount = 0;
+            int despawnTimeCount = 0;
 
             for (Map.Entry<String, BeaconNPCSpawn> entry : new ArrayList<>(beacons.entrySet())) {
                 String beaconId = entry.getKey();
                 BeaconNPCSpawn beacon = entry.getValue();
+
+                // Determine if this beacon spawns hostile NPCs.
+                // Beacons with NPCSpawnState (e.g. "Chase") are hostile -- NPCs
+                // actively target players and despawn when idle without a target.
+                // Beacons without NPCSpawnState are passive/ambient -- fish, animals,
+                // wandering NPCs that persist indefinitely and fill spawn slots.
+                boolean isHostile = beacon.getNpcSpawnState() != null;
+
+                // HYC-167: Increase idle despawn time for hostile beacons to prevent
+                // mid-combat despawns. The engine default is 10 seconds, which is too
+                // short -- if an NPC briefly loses its target (pathfinding failure,
+                // line-of-sight break, target slot cleared during world tick), the
+                // despawn timer expires before the HC_Threat ThreatTargetSystem can
+                // re-assign the target. Only modify beacons still using the default
+                // value to avoid overriding intentionally configured values.
+                if (isHostile && beacon.getNpcIdleDespawnTimeSeconds() <= 10.0) {
+                    if (injectIdleDespawnTime(beacon, hostileIdleDespawnTime)) {
+                        despawnTimeCount++;
+                        LOGGER.atFine().log("[SpawnScaling] Increased idle despawn time for %s: %.0fs -> %.0fs",
+                            beaconId, 10.0, hostileIdleDespawnTime);
+                    }
+                }
 
                 // Check if already has a scaling curve
                 if (beacon.getMaxSpawnsScalingCurve() != null) {
@@ -88,13 +123,6 @@ public class SpawnScalingPlugin extends JavaPlugin {
                 }
 
                 int baseMaxSpawns = beacon.getMaxSpawnedNpcs();
-
-                // Determine if this beacon spawns hostile NPCs.
-                // Beacons with NPCSpawnState (e.g. "Chase") are hostile — NPCs
-                // actively target players and despawn when idle without a target.
-                // Beacons without NPCSpawnState are passive/ambient — fish, animals,
-                // wandering NPCs that persist indefinitely and fill spawn slots.
-                boolean isHostile = beacon.getNpcSpawnState() != null;
                 double density = isHostile ? hostileDensity : passiveDensity;
 
                 // Curve formula: total = base + curve.computeY(playerCount)
@@ -103,7 +131,7 @@ public class SpawnScalingPlugin extends JavaPlugin {
                 //   yMin = 0, yMax = base * (maxPlayers - 1)
                 //
                 // With density (D>1): total = D * base * playerCount
-                //   yMin = base * (D - 1)          — bonus even at 1 player
+                //   yMin = base * (D - 1)          -- bonus even at 1 player
                 //   yMax = base * (D * maxPlayers - 1)
                 //
                 // For passive beacons with D<1, the curve reduces per-player scaling.
@@ -112,7 +140,7 @@ public class SpawnScalingPlugin extends JavaPlugin {
                 double yMin = baseMaxSpawns * (density - 1.0);
                 double yMax = baseMaxSpawns * (density * maxPlayers - 1.0);
 
-                // Clamp yMin to 0 — negative yMin would reduce spawns below base
+                // Clamp yMin to 0 -- negative yMin would reduce spawns below base
                 // for single-player, which we don't want even for passive beacons
                 if (yMin < 0.0) yMin = 0.0;
 
@@ -132,8 +160,8 @@ public class SpawnScalingPlugin extends JavaPlugin {
                 }
             }
 
-            LOGGER.atInfo().log("[SpawnScaling] Injection complete: %d hostile + %d passive beacons modified, %d skipped (already had curves), hostileDensity=%.1fx, passiveDensity=%.1fx",
-                hostileCount, passiveCount, skipCount, hostileDensity, passiveDensity);
+            LOGGER.atInfo().log("[SpawnScaling] Injection complete: %d hostile + %d passive beacons modified, %d skipped (already had curves), hostileDensity=%.1fx, passiveDensity=%.1fx, %d hostile beacons got extended despawn time (%.0fs)",
+                hostileCount, passiveCount, skipCount, hostileDensity, passiveDensity, despawnTimeCount, hostileIdleDespawnTime);
 
         } catch (Exception e) {
             LOGGER.atSevere().log("[SpawnScaling] Failed to inject scaling curves: %s", e.getMessage());
@@ -196,6 +224,33 @@ public class SpawnScalingPlugin extends JavaPlugin {
             return true;
         } catch (Exception e) {
             LOGGER.atWarning().log("[SpawnScaling] Failed to inject curve into beacon: %s", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Injects a new idle despawn time into a beacon spawn using reflection.
+     *
+     * HYC-167: The engine's BeaconSpawnController reads npcIdleDespawnTimeSeconds
+     * from the BeaconNPCSpawn asset at initialization. The ControllerTick system
+     * then uses this value as the timeout threshold: when a hostile NPC has no
+     * target and is not in a busy state, a per-entity timer accumulates delta-time.
+     * Once the timer exceeds npcIdleDespawnTimeSeconds, the NPC is despawned.
+     *
+     * The default value is 10 seconds, which is far too aggressive for high-level
+     * mobs that take minutes to kill. If the NPC's AI temporarily loses its target
+     * (common during long fights due to pathfinding resets, line-of-sight breaks,
+     * or target slot clearing during world ticks), 10 seconds is not enough buffer
+     * for the HC_Threat ThreatTargetSystem to re-assign the player as the target.
+     */
+    private boolean injectIdleDespawnTime(BeaconNPCSpawn beacon, double seconds) {
+        try {
+            Field field = BeaconNPCSpawn.class.getDeclaredField("npcIdleDespawnTimeSeconds");
+            field.setAccessible(true);
+            field.setDouble(beacon, seconds);
+            return true;
+        } catch (Exception e) {
+            LOGGER.atWarning().log("[SpawnScaling] Failed to inject idle despawn time into beacon: %s", e.getMessage());
             return false;
         }
     }
