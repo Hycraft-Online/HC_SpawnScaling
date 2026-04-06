@@ -85,6 +85,24 @@ public class SpawnScalingPlugin extends JavaPlugin {
             double hostileIdleDespawnTime = HC_CoreAPI.getSettingDouble(PLUGIN, "hostileIdleDespawnTime", 120.0);
             if (hostileIdleDespawnTime < 10.0) hostileIdleDespawnTime = 10.0;
 
+            // Resolve reflection fields and Linear curve reference once, not per-beacon
+            Field curveField = BeaconNPCSpawn.class.getDeclaredField("maxSpawnsScalingCurve");
+            curveField.setAccessible(true);
+            Field despawnField = BeaconNPCSpawn.class.getDeclaredField("npcIdleDespawnTimeSeconds");
+            despawnField.setAccessible(true);
+            Field curveRefField = ScaledXYResponseCurve.class.getSuperclass()
+                .getDeclaredField("responseCurveReference");
+            curveRefField.setAccessible(true);
+
+            IndexedLookupTableAssetMap<String, ResponseCurve> curveAssetMap = ResponseCurve.getAssetMap();
+            int linearIndex = curveAssetMap.getIndex("Linear");
+            ResponseCurve linearCurve = curveAssetMap.getAsset(linearIndex);
+            if (linearCurve == null) {
+                LOGGER.atSevere().log("[SpawnScaling] 'Linear' response curve not found in assets — cannot inject scaling");
+                return;
+            }
+            ResponseCurve.Reference linearRef = new ResponseCurve.Reference(linearIndex, linearCurve);
+
             int hostileCount = 0;
             int passiveCount = 0;
             int skipCount = 0;
@@ -109,10 +127,13 @@ public class SpawnScalingPlugin extends JavaPlugin {
                 // re-assign the target. Only modify beacons still using the default
                 // value to avoid overriding intentionally configured values.
                 if (isHostile && beacon.getNpcIdleDespawnTimeSeconds() <= 10.0) {
-                    if (injectIdleDespawnTime(beacon, hostileIdleDespawnTime)) {
+                    try {
+                        despawnField.setDouble(beacon, hostileIdleDespawnTime);
                         despawnTimeCount++;
                         LOGGER.atFine().log("[SpawnScaling] Increased idle despawn time for %s: %.0fs -> %.0fs",
                             beaconId, 10.0, hostileIdleDespawnTime);
+                    } catch (Exception e) {
+                        LOGGER.atWarning().log("[SpawnScaling] Failed to inject idle despawn time for %s: %s", beaconId, e.getMessage());
                     }
                 }
 
@@ -144,12 +165,15 @@ public class SpawnScalingPlugin extends JavaPlugin {
                 // for single-player, which we don't want even for passive beacons
                 if (yMin < 0.0) yMin = 0.0;
 
-                ScaledXYResponseCurve curve = createLinearScalingCurve(
-                    1.0, maxPlayers,  // XRange: player count
-                    yMin, yMax        // YRange: additional spawns
-                );
+                try {
+                    ScaledXYResponseCurve curve = new ScaledXYResponseCurve(
+                        "Linear",
+                        new double[]{1.0, (double) maxPlayers},
+                        new double[]{yMin, yMax}
+                    );
+                    curveRefField.set(curve, linearRef);
+                    curveField.set(beacon, curve);
 
-                if (curve != null && injectCurve(beacon, curve)) {
                     if (isHostile) {
                         hostileCount++;
                     } else {
@@ -157,6 +181,8 @@ public class SpawnScalingPlugin extends JavaPlugin {
                     }
                     LOGGER.atFine().log("[SpawnScaling] Injected curve for %s (base=%d, %s, density=%.1f, yRange=[%.0f, %.0f])",
                         beaconId, baseMaxSpawns, isHostile ? "hostile" : "passive", density, yMin, yMax);
+                } catch (Exception e) {
+                    LOGGER.atWarning().log("[SpawnScaling] Failed to inject curve for %s: %s", beaconId, e.getMessage());
                 }
             }
 
@@ -166,92 +192,6 @@ public class SpawnScalingPlugin extends JavaPlugin {
         } catch (Exception e) {
             LOGGER.atSevere().log("[SpawnScaling] Failed to inject scaling curves: %s", e.getMessage());
             e.printStackTrace();
-        }
-    }
-
-    /**
-     * Creates a linear scaling curve with the given ranges.
-     * The curve interpolates linearly from yMin at xMin to yMax at xMax.
-     */
-    private ScaledXYResponseCurve createLinearScalingCurve(
-            double xMin, double xMax,
-            double yMin, double yMax) {
-        try {
-            // Create the curve using the public constructor
-            ScaledXYResponseCurve curve = new ScaledXYResponseCurve(
-                "Linear",
-                new double[]{xMin, xMax},
-                new double[]{yMin, yMax}
-            );
-
-            // Set up the responseCurveReference field (required for the curve to work)
-            // This mimics what the CODEC's afterDecode does
-            IndexedLookupTableAssetMap<String, ResponseCurve> curveMap = ResponseCurve.getAssetMap();
-            int index = curveMap.getIndex("Linear");
-            ResponseCurve linearCurve = curveMap.getAsset(index);
-
-            if (linearCurve == null) {
-                LOGGER.atWarning().log("[SpawnScaling] 'Linear' response curve not found in assets");
-                return null;
-            }
-
-            // Use reflection to set the responseCurveReference field
-            Field refField = ScaledXYResponseCurve.class.getSuperclass()
-                .getDeclaredField("responseCurveReference");
-            refField.setAccessible(true);
-
-            // Create the Reference object
-            ResponseCurve.Reference ref = new ResponseCurve.Reference(index, linearCurve);
-            refField.set(curve, ref);
-
-            return curve;
-
-        } catch (Exception e) {
-            LOGGER.atSevere().log("[SpawnScaling] Failed to create scaling curve: %s", e.getMessage());
-            e.printStackTrace();
-            return null;
-        }
-    }
-
-    /**
-     * Injects a scaling curve into a beacon spawn using reflection.
-     */
-    private boolean injectCurve(BeaconNPCSpawn beacon, ScaledXYResponseCurve curve) {
-        try {
-            Field field = BeaconNPCSpawn.class.getDeclaredField("maxSpawnsScalingCurve");
-            field.setAccessible(true);
-            field.set(beacon, curve);
-            return true;
-        } catch (Exception e) {
-            LOGGER.atWarning().log("[SpawnScaling] Failed to inject curve into beacon: %s", e.getMessage());
-            return false;
-        }
-    }
-
-    /**
-     * Injects a new idle despawn time into a beacon spawn using reflection.
-     *
-     * HYC-167: The engine's BeaconSpawnController reads npcIdleDespawnTimeSeconds
-     * from the BeaconNPCSpawn asset at initialization. The ControllerTick system
-     * then uses this value as the timeout threshold: when a hostile NPC has no
-     * target and is not in a busy state, a per-entity timer accumulates delta-time.
-     * Once the timer exceeds npcIdleDespawnTimeSeconds, the NPC is despawned.
-     *
-     * The default value is 10 seconds, which is far too aggressive for high-level
-     * mobs that take minutes to kill. If the NPC's AI temporarily loses its target
-     * (common during long fights due to pathfinding resets, line-of-sight breaks,
-     * or target slot clearing during world ticks), 10 seconds is not enough buffer
-     * for the HC_Threat ThreatTargetSystem to re-assign the player as the target.
-     */
-    private boolean injectIdleDespawnTime(BeaconNPCSpawn beacon, double seconds) {
-        try {
-            Field field = BeaconNPCSpawn.class.getDeclaredField("npcIdleDespawnTimeSeconds");
-            field.setAccessible(true);
-            field.setDouble(beacon, seconds);
-            return true;
-        } catch (Exception e) {
-            LOGGER.atWarning().log("[SpawnScaling] Failed to inject idle despawn time into beacon: %s", e.getMessage());
-            return false;
         }
     }
 }
